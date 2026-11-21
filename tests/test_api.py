@@ -14,6 +14,7 @@ from app.services.document_service import DocumentProcessingError, extract_text
 from openai import APITimeoutError
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
+from sqlalchemy.dialects import postgresql
 
 from app.core.config import Settings
 from app.main import create_app
@@ -102,6 +103,35 @@ def test_postgres_url_detection_and_engine_configuration() -> None:
     assert repository.engine.pool is not None
     assert repository.engine.url.drivername == "postgresql+psycopg"
     repository.close()
+
+
+def test_postgres_rate_limit_upsert_compiles_with_postgresql_dialect(monkeypatch) -> None:
+    class SessionStub:
+        statement = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def scalar(self, statement):
+            self.statement = statement
+            statement.compile(dialect=postgresql.dialect())
+            return 1
+
+        def commit(self):
+            pass
+
+    repository = object.__new__(PostgresChatRepository)
+    session = SessionStub()
+    monkeypatch.setattr(repository, "_session", lambda: session)
+
+    assert repository.check_rate_limit("login:test", limit=2)
+    compiled = session.statement.compile(dialect=postgresql.dialect())
+    assert "ON CONFLICT" in compiled.string
+    assert "DO UPDATE" in compiled.string
+    assert "RETURNING" in compiled.string
 
 
 def test_database_url_normalization_preserves_encoded_credentials_and_query() -> None:

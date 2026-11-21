@@ -379,7 +379,7 @@ class PostgresChatRepository:
                 count=1,
             ).on_conflict_do_update(
                 index_elements=[SecurityRateLimit.key],
-                set={
+                set_={
                     "window_started": case(
                         (SecurityRateLimit.window_started <= cutoff, now),
                         else_=SecurityRateLimit.window_started,
