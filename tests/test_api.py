@@ -24,6 +24,8 @@ from app.services.ai_service import (
 )
 from app.services.chat_repository import ChatRepository
 from app.services.providers import openai_provider
+from app.db import is_postgres_url, normalize_database_url
+from app.services.postgres_chat_repository import PostgresChatRepository
 
 
 class FakeProvider:
@@ -84,6 +86,42 @@ def make_client(
         cors_origins=cors_origins or ["http://localhost:5173"],
     )
     return TestClient(create_app(settings, chat_provider=provider))
+
+
+def test_postgres_url_detection_and_engine_configuration() -> None:
+    assert is_postgres_url("postgresql://user:pass@host/db")
+    assert is_postgres_url("postgres://user:pass@host/db")
+    assert normalize_database_url("postgres://user:pass@host/db") == (
+        "postgresql+psycopg://user:pass@host/db"
+    )
+
+    repository = PostgresChatRepository(
+        "postgresql+psycopg://user:pass@127.0.0.1:1/chatbot"
+    )
+    assert repository.engine.pool is not None
+    assert repository.engine.url.drivername == "postgresql+psycopg"
+    repository.close()
+
+
+def test_app_selects_postgres_repository_without_sqlite_fallback(tmp_path) -> None:
+    settings = Settings(
+        database_path=str(tmp_path / "must-not-be-used.db"),
+        database_url="postgresql+psycopg://user:pass@127.0.0.1:1/chatbot",
+    )
+    application = create_app(settings)
+    assert isinstance(
+        application.state.chat_repository,
+        PostgresChatRepository,
+    )
+
+
+def test_app_rejects_unsupported_database_url(tmp_path) -> None:
+    settings = Settings(
+        database_path=str(tmp_path / "test.db"),
+        database_url="mysql://host/db",
+    )
+    with pytest.raises(RuntimeError, match="Unsupported DATABASE_URL"):
+        create_app(settings)
 
 
 def test_health_returns_service_status(tmp_path) -> None:

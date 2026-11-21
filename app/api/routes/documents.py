@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.schemas.chat import UploadedDocument
 from app.api.routes.auth import get_auth_session, validate_csrf
@@ -131,7 +132,7 @@ async def upload_documents(
                 chunks=chunks,
                 user_id=user_id,
             )
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, SQLAlchemyError) as exc:
             stored_path.unlink(missing_ok=True)
             raise HTTPException(status_code=503, detail="Chat storage is unavailable.") from exc
         uploaded.append(UploadedDocument(**document))

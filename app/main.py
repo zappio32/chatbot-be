@@ -13,6 +13,8 @@ from app.services.ai_service import AIService
 from app.services.chat_repository import ChatRepository
 from app.services.providers.base import ChatProvider
 from app.services.email_service import EmailService
+from app.db import is_postgres_url
+from app.services.postgres_chat_repository import PostgresChatRepository
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
@@ -60,7 +62,15 @@ def create_app(
             for origin in app_settings.cors_origins
         ):
             raise RuntimeError("Production CORS origins must use HTTPS.")
-    repository = ChatRepository(app_settings.database_path)
+    database_url = app_settings.database_url.strip()
+    if is_postgres_url(database_url):
+        repository = PostgresChatRepository(database_url)
+    elif database_url.startswith("sqlite:"):
+        repository = ChatRepository(app_settings.database_path)
+    else:
+        raise RuntimeError(
+            "Unsupported DATABASE_URL. Use SQLite or PostgreSQL URL format."
+        )
     ai_service = AIService(app_settings, provider=chat_provider)
     email_service = EmailService(app_settings)
 
@@ -76,6 +86,9 @@ def create_app(
             yield
         finally:
             ai_service.close()
+            close_repository = getattr(repository, "close", None)
+            if close_repository is not None:
+                close_repository()
 
     application = FastAPI(
         title=app_settings.app_name,

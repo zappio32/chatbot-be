@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 from uuid import uuid4
+from sqlalchemy.exc import SQLAlchemyError
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -182,7 +183,7 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             conversation_id,
         )
         suggest_memory(repository, request, conversation_id, payload.message)
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, SQLAlchemyError) as exc:
         logger.exception("Could not save chat exchange")
         raise HTTPException(
             status_code=503,
@@ -282,7 +283,7 @@ def chat_stream(payload: ChatRequest, request: Request) -> StreamingResponse:
                     conversation_id,
                     payload.message,
                 )
-            except sqlite3.Error:
+            except (sqlite3.Error, SQLAlchemyError):
                 logger.exception("Could not save streamed chat exchange")
                 yield f"data: {json.dumps({'type': 'error', 'detail': 'Chat storage is unavailable.'})}\n\n"
                 return
@@ -336,9 +337,11 @@ def create_conversation(payload: ConversationCreate, request: Request) -> Conver
             session_id,
             user_id,
         )
-    except sqlite3.IntegrityError as exc:
+    except (sqlite3.IntegrityError, SQLAlchemyError) as exc:
         raise HTTPException(status_code=409, detail="Conversation already exists.") from exc
-    except sqlite3.Error as exc:
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (sqlite3.Error, SQLAlchemyError) as exc:
         raise HTTPException(status_code=503, detail="Chat storage is unavailable.") from exc
     return Conversation(**conversation)
 

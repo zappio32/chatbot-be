@@ -55,9 +55,12 @@ def is_expired(value: str) -> bool:
 
 def fetch_rows(connection: sqlite3.Connection, table: str) -> list[tuple]:
     try:
-        return connection.execute(
+        return [
+            tuple(row)
+            for row in connection.execute(
             f'SELECT * FROM "{table}"'
-        ).fetchall()
+            ).fetchall()
+        ]
     except sqlite3.Error:
         return []
 
@@ -100,10 +103,34 @@ def insert_rows(
     inserted = 0
     with destination.cursor() as cursor:
         for row in rows:
+            normalized = list(row)
+            boolean_columns = {
+                "active",
+                "email_verified",
+                "revoked",
+                "used",
+                "enabled",
+            }
+            datetime_columns = {
+                "created_at",
+                "updated_at",
+                "expires_at",
+                "window_started",
+            }
+            for index, column_name in enumerate(column_names):
+                if column_name in boolean_columns:
+                    normalized[index] = bool(normalized[index])
+                elif column_name in datetime_columns and normalized[index]:
+                    value = normalized[index]
+                    if isinstance(value, str):
+                        try:
+                            normalized[index] = datetime.fromisoformat(value)
+                        except ValueError:
+                            pass
             cursor.execute(
                 f'INSERT INTO "{table}" ({column_sql}) VALUES ({placeholders})'
                 + conflict,
-                row,
+                tuple(normalized),
             )
             inserted += cursor.rowcount
     return inserted
