@@ -91,6 +91,7 @@ def make_client(
 def test_postgres_url_detection_and_engine_configuration() -> None:
     assert is_postgres_url("postgresql://user:pass@host/db")
     assert is_postgres_url("postgres://user:pass@host/db")
+    assert is_postgres_url("postgresql+psycopg://user:pass@host/db")
     assert normalize_database_url("postgres://user:pass@host/db") == (
         "postgresql+psycopg://user:pass@host/db"
     )
@@ -101,6 +102,26 @@ def test_postgres_url_detection_and_engine_configuration() -> None:
     assert repository.engine.pool is not None
     assert repository.engine.url.drivername == "postgresql+psycopg"
     repository.close()
+
+
+def test_database_url_normalization_preserves_encoded_credentials_and_query() -> None:
+    legacy_url = (
+        "postgres://user%40domain:p%40ss%3Aword@db.example:5432/"
+        "chat%2Fbot?sslmode=require&options=-c%20search_path%3Dchatbot"
+    )
+    normalized = normalize_database_url(legacy_url)
+
+    assert normalized == (
+        "postgresql+psycopg://user%40domain:p%40ss%3Aword@db.example:5432/"
+        "chat%2Fbot?sslmode=require&options=-c%20search_path%3Dchatbot"
+    )
+    assert normalize_database_url("postgresql://user:pass@host/db") == (
+        "postgresql+psycopg://user:pass@host/db"
+    )
+    driver_url = "postgresql+psycopg://user:pass@host/db?sslmode=require"
+    assert normalize_database_url(driver_url) == driver_url
+    sqlite_url = "sqlite:///data/chatbot.db"
+    assert normalize_database_url(sqlite_url) == sqlite_url
 
 
 def test_app_selects_postgres_repository_without_sqlite_fallback(tmp_path) -> None:
@@ -115,13 +136,32 @@ def test_app_selects_postgres_repository_without_sqlite_fallback(tmp_path) -> No
     )
 
 
+def test_app_accepts_legacy_postgres_url_and_keeps_sqlite_selection(tmp_path) -> None:
+    postgres_app = create_app(Settings(
+        database_path=str(tmp_path / "must-not-be-used.db"),
+        database_url="postgres://user:pass@127.0.0.1:1/chatbot",
+    ))
+    postgres_repository = postgres_app.state.chat_repository
+    assert isinstance(postgres_repository, PostgresChatRepository)
+    assert postgres_repository.engine.url.drivername == "postgresql+psycopg"
+    postgres_repository.close()
+
+    sqlite_app = create_app(Settings(
+        database_path=str(tmp_path / "sqlite.db"),
+        database_url="sqlite:///ignored-path.db",
+    ))
+    assert isinstance(sqlite_app.state.chat_repository, ChatRepository)
+
+
 def test_app_rejects_unsupported_database_url(tmp_path) -> None:
+    unsupported_url = "mysql://user:secret-password@host/db"
     settings = Settings(
         database_path=str(tmp_path / "test.db"),
-        database_url="mysql://host/db",
+        database_url=unsupported_url,
     )
-    with pytest.raises(RuntimeError, match="Unsupported DATABASE_URL"):
+    with pytest.raises(RuntimeError, match="Unsupported DATABASE_URL") as exc_info:
         create_app(settings)
+    assert "secret-password" not in str(exc_info.value)
 
 
 def test_health_returns_service_status(tmp_path) -> None:

@@ -1,5 +1,5 @@
 from collections.abc import Iterator
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -16,10 +16,9 @@ def is_postgres_url(database_url: str) -> bool:
 
 
 def normalize_database_url(database_url: str) -> str:
-    if database_url.startswith("postgres://"):
-        return "postgresql+psycopg://" + database_url[len("postgres://"):]
-    if database_url.startswith("postgresql://"):
-        return "postgresql+psycopg://" + database_url[len("postgresql://"):]
+    parsed = urlsplit(database_url)
+    if parsed.scheme.lower() in {"postgres", "postgresql"}:
+        return urlunsplit(parsed._replace(scheme="postgresql+psycopg"))
     return database_url
 
 

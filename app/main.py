@@ -15,7 +15,7 @@ from app.services.ai_service import AIService
 from app.services.chat_repository import ChatRepository
 from app.services.providers.base import ChatProvider
 from app.services.email_service import EmailService
-from app.db import is_postgres_url
+from app.db import is_postgres_url, normalize_database_url
 from app.services.postgres_chat_repository import PostgresChatRepository
 
 
@@ -65,6 +65,7 @@ def create_app(
         ):
             raise RuntimeError("Production CORS origins must use HTTPS.")
     database_url = app_settings.database_url.strip()
+    database_url = normalize_database_url(database_url)
     if is_postgres_url(database_url):
         repository = PostgresChatRepository(database_url)
     elif database_url.startswith("sqlite:"):
