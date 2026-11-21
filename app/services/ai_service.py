@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from collections.abc import Iterator
 from typing import Literal
 
 from app.core.config import Settings
@@ -30,6 +31,10 @@ class AIProviderRejectedError(AIServiceError):
         "The AI provider rejected the request. Check backend provider configuration."
     )
 
+    def __init__(self, public_message: str | None = None) -> None:
+        if public_message:
+            self.public_message = public_message
+
 
 class AIProviderTimeoutError(AIServiceError):
     status_code = 504
@@ -56,19 +61,23 @@ class AIService:
         self._settings = settings
         self._provider = provider
 
-    def generate_response(self, message: str) -> AIResponse:
+    def generate_response(
+        self,
+        message: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> AIResponse:
         if self._settings.use_mock_ai:
             return AIResponse(
                 text=f"DEMO MODE: This is a mock response. You said: {message}",
                 mode="demo",
             )
 
-        if self._settings.ai_provider != "openai":
+        if self._settings.ai_provider != "groq":
             raise AIConfigurationError(
                 "The configured AI provider is not supported."
             )
-        if not self._settings.openai_model:
-            raise AIConfigurationError("OPENAI_MODEL is not configured.")
+        if not self._settings.groq_model:
+            raise AIConfigurationError("GROQ_MODEL is not configured.")
 
         provider = self._provider
         if provider is None:
@@ -77,8 +86,34 @@ class AIService:
             provider = OpenAIProvider(self._settings)
             self._provider = provider
 
-        response = provider.generate_response(message)
+        response = provider.generate_response(message, history)
         return AIResponse(text=response, mode="live")
+
+    def generate_stream(
+        self,
+        message: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> tuple[Literal["demo", "live"], Iterator[str]]:
+        if self._settings.use_mock_ai:
+            text = f"DEMO MODE: This is a mock response. You said: {message}"
+            return "demo", iter(text[i:i + 12] for i in range(0, len(text), 12))
+
+        if self._settings.ai_provider != "groq":
+            raise AIConfigurationError("The configured AI provider is not supported.")
+        if not self._settings.groq_model:
+            raise AIConfigurationError("GROQ_MODEL is not configured.")
+
+        provider = self._provider
+        if provider is None:
+            from app.services.providers.openai_provider import OpenAIProvider
+
+            provider = OpenAIProvider(self._settings)
+            self._provider = provider
+
+        generate_stream = getattr(provider, "generate_stream", None)
+        if generate_stream is None:
+            return "live", iter([provider.generate_response(message, history)])
+        return "live", generate_stream(message, history)
 
     def close(self) -> None:
         close = getattr(self._provider, "close", None)

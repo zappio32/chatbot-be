@@ -3,6 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 import httpx
+import io
+import subprocess
+import sys
+from docx import Document
+from openpyxl import Workbook
+from pypdf import PdfWriter
+from PIL import Image
+from app.services.document_service import DocumentProcessingError, extract_text
 from openai import APITimeoutError
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
@@ -29,11 +37,29 @@ class FakeProvider:
         self.closed = False
         self.calls = 0
 
-    def generate_response(self, message: str) -> str:
+    def generate_response(
+        self,
+        message: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> str:
         self.calls += 1
+        self.history = history
         if self.error is not None:
             raise self.error
         return self.response
+
+    def generate_stream(
+        self,
+        message: str,
+        history: list[dict[str, str]] | None = None,
+    ):
+        self.calls += 1
+        self.history = history
+        if self.error is not None:
+            raise self.error
+        midpoint = max(1, len(self.response) // 2)
+        yield self.response[:midpoint]
+        yield self.response[midpoint:]
 
     def close(self) -> None:
         self.closed = True
@@ -45,15 +71,15 @@ def make_client(
     use_mock_ai: bool = True,
     api_key: str | None = None,
     model: str | None = None,
-    ai_provider: str = "openai",
+    ai_provider: str = "groq",
     provider: FakeProvider | None = None,
     cors_origins: list[str] | None = None,
 ) -> TestClient:
     settings = Settings(
         database_path=database_path,
         use_mock_ai=use_mock_ai,
-        openai_api_key=SecretStr(api_key) if api_key else None,
-        openai_model=model,
+        groq_api_key=SecretStr(api_key) if api_key else None,
+        groq_model=model,
         ai_provider=ai_provider,
         cors_origins=cors_origins or ["http://localhost:5173"],
     )
@@ -123,7 +149,7 @@ def test_chat_uses_mocked_live_provider_and_matches_frontend_contract(
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"request_id", "response", "mode"}
+    assert {"request_id", "response", "mode", "conversation_id"} == set(body)
     assert body["response"] == "A genuine-provider-shaped mocked response."
     assert body["mode"] == "live"
     assert provider.closed
@@ -166,8 +192,8 @@ def test_live_chat_returns_safe_error_when_api_key_is_missing(tmp_path) -> None:
         response = client.post("/chat", json={"message": "Hello"})
 
     assert response.status_code == 503
-    assert "OPENAI_API_KEY" in response.json()["detail"]
-    assert "OPENAI_MODEL" not in response.json()["detail"]
+    assert "GROQ_API_KEY" in response.json()["detail"]
+    assert "GROQ_MODEL" not in response.json()["detail"]
 
 
 def test_live_chat_returns_safe_error_when_model_is_missing(tmp_path) -> None:
@@ -179,7 +205,7 @@ def test_live_chat_returns_safe_error_when_model_is_missing(tmp_path) -> None:
         response = client.post("/chat", json={"message": "Hello"})
 
     assert response.status_code == 503
-    assert "OPENAI_MODEL" in response.json()["detail"]
+    assert "GROQ_MODEL" in response.json()["detail"]
 
 
 def test_live_chat_rejects_unsupported_provider(tmp_path) -> None:
@@ -296,10 +322,10 @@ def test_openai_provider_uses_configured_settings_without_network(
     provider = openai_provider.OpenAIProvider(
         Settings(
             use_mock_ai=False,
-            openai_api_key="test-key",
-            openai_model="configured-test-model",
-            openai_base_url="https://api.example.com/v1",
-            openai_timeout_seconds=12,
+            groq_api_key="test-key",
+            groq_model="configured-test-model",
+            groq_base_url="https://api.example.com/v1",
+            groq_timeout_seconds=12,
         )
     )
 
@@ -326,8 +352,8 @@ def test_openai_provider_maps_sdk_timeout_without_leaking_details(
     provider = openai_provider.OpenAIProvider(
         Settings(
             use_mock_ai=False,
-            openai_api_key="test-key",
-            openai_model="configured-test-model",
+            groq_api_key="test-key",
+            groq_model="configured-test-model",
         )
     )
 
@@ -349,6 +375,523 @@ def test_openai_provider_maps_sdk_timeout_without_leaking_details(
         provider.generate_response("Hello")
 
     assert "test-key" not in caplog.text
+
+
+def test_document_upload_txt_and_retrieval(tmp_path) -> None:
+    database_path = str(tmp_path / "documents.db")
+    with make_client(database_path) as client:
+        created = client.post(
+            "/conversations",
+            json={"title": "Documents", "conversation_id": "doc-1"},
+        )
+        assert created.status_code == 201
+        uploaded = client.post(
+            "/conversations/doc-1/documents",
+            files={"files": ("notes.txt", b"Revenue was $125,000", "text/plain")},
+        )
+        assert uploaded.status_code == 200
+        document = uploaded.json()[0]
+        assert document["status"] == "ready"
+        assert document["extension"] == ".txt"
+
+        listed = client.get("/conversations/doc-1/documents")
+        assert listed.status_code == 200
+        assert listed.json()[0]["id"] == document["id"]
+
+        chunks = client.app.state.chat_repository.retrieve_document_chunks(
+            "doc-1",
+            "Revenue amount",
+            4,
+        )
+        assert any("125,000" in chunk["text"] for chunk in chunks)
+
+        deleted = client.delete(
+            f"/conversations/doc-1/documents/{document['id']}"
+        )
+        assert deleted.status_code == 204
+
+
+def test_document_upload_rejects_invalid_type_and_image(tmp_path) -> None:
+    database_path = str(tmp_path / "documents-invalid.db")
+    with make_client(database_path) as client:
+        client.post(
+            "/conversations",
+            json={"title": "Documents", "conversation_id": "doc-invalid"},
+        )
+        executable = client.post(
+            "/conversations/doc-invalid/documents",
+            files={"files": ("malware.exe", b"MZ", "application/octet-stream")},
+        )
+        assert executable.status_code == 415
+
+        invalid_image = client.post(
+            "/conversations/doc-invalid/documents",
+            files={"files": ("fake.png", b"not an image", "image/png")},
+        )
+        assert invalid_image.status_code == 422
+
+
+def test_image_ocr_is_safe_when_engine_is_unavailable(tmp_path) -> None:
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (16, 16), color="white").save(image_buffer, format="PNG")
+    with pytest.raises(DocumentProcessingError, match="Tesseract OCR"):
+        extract_text(
+            "empty.png",
+            image_buffer.getvalue(),
+            ocr_enabled=True,
+            tesseract_cmd=None,
+        )
+
+    with pytest.raises(DocumentProcessingError, match="invalid"):
+        extract_text(
+            "corrupt.png",
+            b"not a png",
+            ocr_enabled=True,
+        )
+
+
+def test_pdf_csv_and_image_uploads(tmp_path) -> None:
+    database_path = str(tmp_path / "formats.db")
+    pdf_buffer = io.BytesIO()
+    pdf_writer = PdfWriter()
+    pdf_writer.add_blank_page(width=612, height=792)
+    pdf_writer.write(pdf_buffer)
+
+    image_buffer = io.BytesIO()
+    Image.new("RGB", (16, 16), color="red").save(image_buffer, format="PNG")
+
+    with make_client(database_path) as client:
+        client.post(
+            "/conversations",
+            json={"title": "Formats", "conversation_id": "formats-1"},
+        )
+        pdf_upload = client.post(
+            "/conversations/formats-1/documents",
+            files={"files": ("report.pdf", pdf_buffer.getvalue(), "application/pdf")},
+        )
+        csv_upload = client.post(
+            "/conversations/formats-1/documents",
+            files={"files": ("sales.csv", b"Region,Revenue\nNorth,125000\n", "text/csv")},
+        )
+        image_upload = client.post(
+            "/conversations/formats-1/documents",
+            files={"files": ("chart.png", image_buffer.getvalue(), "image/png")},
+        )
+
+        assert pdf_upload.status_code == 200
+        assert pdf_upload.json()[0]["status"] == "limited"
+        assert csv_upload.status_code == 200
+        assert csv_upload.json()[0]["status"] == "ready"
+        assert image_upload.status_code == 200
+        assert image_upload.json()[0]["status"] == "limited"
+
+
+def test_memory_crud_duplicate_sensitive_filter_and_disable(tmp_path) -> None:
+    database_path = str(tmp_path / "memory.db")
+    with make_client(database_path) as client:
+        created = client.post(
+            "/memory",
+            json={
+                "category": "work_and_projects",
+                "project": "POS software",
+                "content": "Use Laravel for the POS project",
+            },
+        )
+        assert created.status_code == 201
+        memory_id = created.json()["id"]
+
+        duplicate = client.post(
+            "/memory",
+            json={
+                "category": "work_and_projects",
+                "project": "POS software",
+                "content": "Use Laravel for the POS project",
+            },
+        )
+        assert duplicate.status_code == 201
+        assert duplicate.json()["id"] == memory_id
+
+        sensitive = client.post(
+            "/memory",
+            json={
+                "category": "important_facts",
+                "project": "",
+                "content": "My password is secret123",
+            },
+        )
+        assert sensitive.status_code == 400
+
+        disabled = client.patch(
+            "/memory/settings",
+            json={"enabled": False},
+        )
+        assert disabled.status_code == 200
+        assert disabled.json() == {"enabled": False}
+
+        enabled = client.patch(
+            "/memory/settings",
+            json={"enabled": True},
+        )
+        assert enabled.status_code == 200
+        assert enabled.json() == {"enabled": True}
+
+        updated = client.patch(
+            f"/memory/{memory_id}",
+            json={
+                "category": "work_and_projects",
+                "project": "POS software",
+                "content": "Use PHP and Laravel for the POS project",
+                "enabled": True,
+            },
+        )
+        assert updated.status_code == 200
+        assert "PHP" in updated.json()["content"]
+
+        deleted = client.delete(f"/memory/{memory_id}")
+        assert deleted.status_code == 204
+
+
+def test_security_rate_limit_uses_database(tmp_path) -> None:
+    database_path = str(tmp_path / "rate.db")
+    with make_client(database_path) as client:
+        repository = client.app.state.chat_repository
+        assert repository.check_rate_limit("login:test", 2)
+        assert repository.check_rate_limit("login:test", 2)
+        assert not repository.check_rate_limit("login:test", 2)
+
+
+def test_sqlite_postgres_migration_dry_run(tmp_path) -> None:
+    database_path = tmp_path / "migration.db"
+    with make_client(str(database_path)) as client:
+        client.post(
+            "/conversations",
+            json={"title": "Migration", "conversation_id": "migration-1"},
+        )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/migrate_sqlite_to_postgres.py",
+            "--sqlite",
+            str(database_path),
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "Source SQLite record counts:" in completed.stdout
+    assert "conversations:" in completed.stdout
+    assert "No destination changes were made." in completed.stdout
+
+
+def test_email_verification_and_reset_lifecycle(tmp_path) -> None:
+    database_path = str(tmp_path / "verification.db")
+    with make_client(database_path) as client:
+        registered = client.post(
+            "/auth/register",
+            json={
+                "email": "verify@example.com",
+                "password": "StrongPassword123",
+            },
+        )
+        assert registered.status_code == 201
+        user_id = registered.json()["user"]["id"]
+        verification = client.app.state.chat_repository.create_email_verification(
+            user_id,
+            60,
+        )
+        verified = client.post(
+            "/auth/verify-email",
+            headers={"X-Verification-Token": verification},
+        )
+        assert verified.status_code == 204
+        reused = client.post(
+            "/auth/verify-email",
+            headers={"X-Verification-Token": verification},
+        )
+        assert reused.status_code == 400
+
+
+def test_production_settings_reject_insecure_configuration(tmp_path) -> None:
+    with pytest.raises(RuntimeError):
+        create_app(
+            Settings(
+                database_path=str(tmp_path / "production.db"),
+                environment="production",
+                session_secret=None,
+                cors_origins=["https://assistant.example.com"],
+                cookie_secure=True,
+            )
+        )
+
+    with pytest.raises(RuntimeError):
+        create_app(
+            Settings(
+                database_path=str(tmp_path / "production.db"),
+                environment="production",
+                session_secret=SecretStr("x" * 32),
+                cors_origins=["http://localhost:5173"],
+                cookie_secure=True,
+            )
+        )
+
+
+def test_registration_login_logout_and_password_hash(tmp_path) -> None:
+    database_path = str(tmp_path / "auth.db")
+    with make_client(database_path) as client:
+        registered = client.post(
+            "/auth/register",
+            json={
+                "email": "User@Example.com",
+                "password": "StrongPassword123",
+                "display_name": "Test User",
+            },
+        )
+        assert registered.status_code == 201
+        assert registered.json()["user"]["email"] == "user@example.com"
+        csrf = registered.json()["csrf_token"]
+
+        me = client.get("/auth/me")
+        assert me.status_code == 200
+
+        logout = client.post(
+            "/auth/logout",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert logout.status_code == 204
+        assert client.get("/auth/me").status_code == 401
+
+        login = client.post(
+            "/auth/login",
+            json={
+                "email": "USER@example.com",
+                "password": "StrongPassword123",
+            },
+        )
+        assert login.status_code == 200
+
+        wrong = client.post(
+            "/auth/login",
+            json={
+                "email": "user@example.com",
+                "password": "wrong-password",
+            },
+        )
+        assert wrong.status_code == 401
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT password_hash FROM users WHERE email = 'user@example.com'"
+        ).fetchone()
+    assert row
+    assert "StrongPassword123" not in row[0]
+    assert row[0].startswith("$2")
+
+
+def test_duplicate_email_and_cross_user_record_isolation(tmp_path) -> None:
+    database_path = str(tmp_path / "auth-isolation.db")
+    with make_client(database_path) as first:
+        first_register = first.post(
+            "/auth/register",
+            json={
+                "email": "first@example.com",
+                "password": "StrongPassword123",
+                "display_name": "First",
+            },
+        )
+        assert first_register.status_code == 201
+        first_csrf = first_register.json()["csrf_token"]
+        created = first.post(
+            "/conversations",
+            json={"title": "Private", "conversation_id": "private-1"},
+            headers={"X-CSRF-Token": first_csrf},
+        )
+        assert created.status_code == 201
+        memory = first.post(
+            "/memory",
+            json={
+                "category": "important_facts",
+                "project": "Private",
+                "content": "Private first user fact",
+            },
+            headers={"X-CSRF-Token": first_csrf},
+        )
+        assert memory.status_code == 201
+
+    with make_client(database_path) as second:
+        second_register = second.post(
+            "/auth/register",
+            json={
+                "email": "second@example.com",
+                "password": "StrongPassword123",
+                "display_name": "Second",
+            },
+        )
+        assert second_register.status_code == 201
+        second_csrf = second_register.json()["csrf_token"]
+
+        duplicate = second.post(
+            "/auth/register",
+            json={
+                "email": "SECOND@example.com",
+                "password": "DifferentPassword123",
+            },
+        )
+        assert duplicate.status_code == 409
+
+        assert second.get("/conversations").json() == []
+        assert second.get("/conversations/private-1").status_code == 404
+        assert second.get("/memory").json() == []
+        delete = second.delete(
+            "/conversations/private-1",
+            headers={"X-CSRF-Token": second_csrf},
+        )
+        assert delete.status_code == 404
+
+
+def test_password_reset_token_is_single_use(tmp_path) -> None:
+    database_path = str(tmp_path / "reset.db")
+    with make_client(database_path) as client:
+        registered = client.post(
+            "/auth/register",
+            json={
+                "email": "reset@example.com",
+                "password": "OriginalPassword123",
+            },
+        )
+        assert registered.status_code == 201
+
+        forgot = client.post(
+            "/auth/forgot-password",
+            json={"email": "reset@example.com"},
+        )
+        assert forgot.status_code == 202
+
+        token = client.app.state.chat_repository.create_password_reset(
+            "reset@example.com",
+            30,
+        )
+        assert token
+        reset = client.post(
+            "/auth/reset-password",
+            json={
+                "token": token,
+                "new_password": "ReplacementPassword123",
+            },
+        )
+        assert reset.status_code == 204
+        reused = client.post(
+            "/auth/reset-password",
+            json={
+                "token": token,
+                "new_password": "AnotherPassword123",
+            },
+        )
+        assert reused.status_code == 400
+
+
+def test_memory_sessions_are_isolated(tmp_path) -> None:
+    database_path = str(tmp_path / "memory-isolation.db")
+    with make_client(database_path) as first:
+        created = first.post(
+            "/memory",
+            json={
+                "category": "important_facts",
+                "project": "Private",
+                "content": "First session personal fact",
+            },
+        )
+        assert created.status_code == 201
+
+    with make_client(database_path) as second:
+        memories = second.get("/memory")
+        assert memories.status_code == 200
+        assert memories.json() == []
+
+
+def test_memory_suggestions_require_review(tmp_path) -> None:
+    database_path = str(tmp_path / "memory-suggestions.db")
+    with make_client(database_path) as client:
+        created = client.post(
+            "/conversations",
+            json={"title": "Memory", "conversation_id": "memory-1"},
+        )
+        assert created.status_code == 201
+
+        chat = client.post(
+            "/chat",
+            json={
+                "message": "Remember: I prefer concise answers",
+                "conversation_id": "memory-1",
+            },
+        )
+        assert chat.status_code == 200
+
+        suggestions = client.get("/memory/suggestions")
+        assert suggestions.status_code == 200
+        assert suggestions.json()
+
+        suggestion_id = suggestions.json()[0]["id"]
+        accepted = client.post(
+            f"/memory/suggestions/{suggestion_id}/accept"
+        )
+        assert accepted.status_code == 200
+
+
+def test_docx_and_xlsx_extraction(tmp_path) -> None:
+    database_path = str(tmp_path / "office.db")
+    docx_buffer = io.BytesIO()
+    document = Document()
+    document.add_heading("Sales Report", level=1)
+    document.add_paragraph("Total revenue was 125000.")
+    document.save(docx_buffer)
+
+    xlsx_buffer = io.BytesIO()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Sales"
+    sheet.append(["Region", "Revenue"])
+    sheet.append(["North", 125000])
+    workbook.save(xlsx_buffer)
+
+    with make_client(database_path) as client:
+        client.post(
+            "/conversations",
+            json={"title": "Office", "conversation_id": "office-1"},
+        )
+        docx_upload = client.post(
+            "/conversations/office-1/documents",
+            files={
+                "files": (
+                    "report.docx",
+                    docx_buffer.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        xlsx_upload = client.post(
+            "/conversations/office-1/documents",
+            files={
+                "files": (
+                    "sales.xlsx",
+                    xlsx_buffer.getvalue(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert docx_upload.status_code == 200
+        assert xlsx_upload.status_code == 200
+        assert docx_upload.json()[0]["status"] == "ready"
+        assert xlsx_upload.json()[0]["source_summary"] == "Sheet: Sales"
+
+        chunks = client.app.state.chat_repository.retrieve_document_chunks(
+            "office-1",
+            "sales revenue",
+            4,
+        )
+        assert chunks
+        assert any("125000" in chunk["text"] or "Sales" in chunk["text"] for chunk in chunks)
 
 
 def test_repository_migrates_existing_demo_only_constraint(tmp_path) -> None:
@@ -385,3 +928,121 @@ def test_repository_migrates_existing_demo_only_constraint(tmp_path) -> None:
         ("old message", "old response", "demo"),
         ("new message", "live response", "live"),
     ]
+
+
+def test_conversation_crud_and_history(tmp_path) -> None:
+    database_path = str(tmp_path / "conversations.db")
+    with make_client(database_path) as client:
+        created = client.post(
+            "/conversations",
+            json={"title": "Project discussion", "conversation_id": "project-1"},
+        )
+        assert created.status_code == 201
+        conversation_id = created.json()["id"]
+
+        first = client.post(
+            "/chat",
+            json={"message": "Remember the codename Atlas", "conversation_id": conversation_id},
+        )
+        second = client.post(
+            "/chat",
+            json={"message": "What codename?", "conversation_id": conversation_id},
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        detail = client.get(f"/conversations/{conversation_id}")
+        assert detail.status_code == 200
+        messages = detail.json()["messages"]
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+
+        renamed = client.patch(
+            f"/conversations/{conversation_id}",
+            json={"title": "Atlas project"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["title"] == "Atlas project"
+
+        history = client.get("/conversations")
+        assert history.status_code == 200
+        assert history.json()[0]["title"] == "Atlas project"
+
+        deleted = client.delete(f"/conversations/{conversation_id}")
+        assert deleted.status_code == 204
+        assert client.get(f"/conversations/{conversation_id}").status_code == 404
+
+
+def test_conversations_are_isolated_for_provider_context(tmp_path) -> None:
+    database_path = str(tmp_path / "isolation.db")
+    provider = FakeProvider("Context-aware response")
+    with make_client(
+        database_path,
+        use_mock_ai=False,
+        api_key="test-key",
+        model="test-model",
+        provider=provider,
+    ) as client:
+        first = client.post("/conversations", json={"title": "First", "conversation_id": "first"})
+        second = client.post("/conversations", json={"title": "Second", "conversation_id": "second"})
+        assert first.status_code == 201
+        assert second.status_code == 201
+
+        client.post(
+            "/chat",
+            json={"message": "Secret from first conversation", "conversation_id": "first"},
+        )
+        client.post(
+            "/chat",
+            json={"message": "Question in second conversation", "conversation_id": "second"},
+        )
+
+    assert provider.history == []
+
+
+def test_stream_chat_persists_completed_response(tmp_path) -> None:
+    database_path = str(tmp_path / "stream.db")
+    provider = FakeProvider("Streaming complete response")
+    with make_client(
+        database_path,
+        use_mock_ai=False,
+        api_key="test-key",
+        model="test-model",
+        provider=provider,
+    ) as client:
+        created = client.post(
+            "/conversations",
+            json={"title": "Stream", "conversation_id": "stream-1"},
+        )
+        assert created.status_code == 201
+
+        with client.stream(
+            "POST",
+            "/chat/stream",
+            json={"message": "Stream this", "conversation_id": "stream-1"},
+        ) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            events = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in response.iter_text())
+
+    assert '"type": "token"' in events
+    assert '"type": "done"' in events
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT conversation_id, message, response, mode
+            FROM chat_exchanges
+            WHERE conversation_id = 'stream-1'
+            """
+        ).fetchone()
+    assert row == (
+        "stream-1",
+        "Stream this",
+        "Streaming complete response",
+        "live",
+    )
