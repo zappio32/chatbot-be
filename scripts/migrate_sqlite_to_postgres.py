@@ -98,7 +98,7 @@ def insert_rows(
             )
         )
     else:
-        conflict = f' ON CONFLICT ("{column_names[0]}") DO NOTHING'
+        conflict = " ON CONFLICT DO NOTHING"
 
     inserted = 0
     with destination.cursor() as cursor:

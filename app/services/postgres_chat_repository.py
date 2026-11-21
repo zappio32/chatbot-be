@@ -4,7 +4,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import bcrypt
-from sqlalchemy import select, update, delete
+from sqlalchemy import case, select, update, delete
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -44,6 +45,14 @@ class PostgresChatRepository:
 
     def _session(self) -> Session:
         return self.SessionLocal()
+
+    @staticmethod
+    def _resolve_user_id(session: Session, session_id: str) -> str | None:
+        if not session_id:
+            return None
+        return session_id if session.scalar(
+            select(User.id).where(User.id == session_id)
+        ) else None
 
     @staticmethod
     def normalize_email(email: str) -> str:
@@ -363,25 +372,33 @@ class PostgresChatRepository:
     def check_rate_limit(self, key: str, limit: int, window_seconds: int = 900) -> bool:
         now = datetime.now(timezone.utc)
         with self._session() as session:
-            row = session.scalar(select(SecurityRateLimit).where(SecurityRateLimit.key == key))
-            if row is None:
-                session.add(SecurityRateLimit(key=key, window_started=now, count=1))
-                session.commit()
-                return True
-            started = row.window_started
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=timezone.utc)
-            if now - started >= timedelta(seconds=window_seconds):
-                row.window_started = now
-                row.count = 1
-                session.commit()
-                return True
-            if row.count >= limit:
-                session.commit()
-                return False
-            row.count += 1
+            cutoff = now - timedelta(seconds=window_seconds)
+            statement = pg_insert(SecurityRateLimit).values(
+                key=key,
+                window_started=now,
+                count=1,
+            ).on_conflict_do_update(
+                index_elements=[SecurityRateLimit.key],
+                set={
+                    "window_started": case(
+                        (SecurityRateLimit.window_started <= cutoff, now),
+                        else_=SecurityRateLimit.window_started,
+                    ),
+                    "count": case(
+                        (SecurityRateLimit.window_started <= cutoff, 1),
+                        (
+                            SecurityRateLimit.count >= limit,
+                            SecurityRateLimit.count,
+                        ),
+                        else_=SecurityRateLimit.count + 1,
+                    ),
+                },
+            ).returning(SecurityRateLimit.count)
+            count = session.scalar(statement)
             session.commit()
-            return True
+            if count is None:
+                return False
+            return count <= limit
 
     def change_password(
         self,
@@ -524,23 +541,70 @@ class PostgresChatRepository:
             return 0
         with self._session() as session:
             count = 0
-            for model in (Conversation, MemoryEntry, MemorySuggestion):
-                rows = session.scalars(
-                    select(model).where(
-                        getattr(model, "session_id") == session_id,
-                        getattr(model, "user_id").is_(None),
+            conversations = session.scalars(
+                select(Conversation).where(
+                    Conversation.session_id == session_id,
+                    Conversation.user_id.is_(None),
+                )
+            ).all()
+            for row in conversations:
+                row.user_id = user_id
+                row.session_id = user_id
+                count += 1
+
+            memories = session.scalars(
+                select(MemoryEntry).where(
+                    MemoryEntry.session_id == session_id,
+                    MemoryEntry.user_id.is_(None),
+                )
+            ).all()
+            for row in memories:
+                duplicate = session.scalar(
+                    select(MemoryEntry).where(
+                        MemoryEntry.session_id == user_id,
+                        MemoryEntry.project == row.project,
+                        MemoryEntry.content == row.content,
                     )
-                ).all()
-                for row in rows:
+                )
+                if duplicate is not None:
+                    session.delete(row)
+                else:
                     row.user_id = user_id
                     row.session_id = user_id
                     count += 1
-            settings = session.scalar(
+
+            suggestions = session.scalars(
+                select(MemorySuggestion).where(
+                    MemorySuggestion.session_id == session_id,
+                    MemorySuggestion.user_id.is_(None),
+                )
+            ).all()
+            for row in suggestions:
+                duplicate = session.scalar(
+                    select(MemorySuggestion).where(
+                        MemorySuggestion.session_id == user_id,
+                        MemorySuggestion.content == row.content,
+                    )
+                )
+                if duplicate is not None:
+                    session.delete(row)
+                else:
+                    row.user_id = user_id
+                    row.session_id = user_id
+                    count += 1
+
+            legacy_settings = session.scalar(
                 select(MemorySettings).where(MemorySettings.session_id == session_id)
             )
-            if settings:
-                settings.user_id = user_id
-                settings.session_id = user_id
+            if legacy_settings:
+                target_settings = session.scalar(
+                    select(MemorySettings).where(MemorySettings.session_id == user_id)
+                )
+                if target_settings is not None:
+                    session.delete(legacy_settings)
+                else:
+                    legacy_settings.user_id = user_id
+                    legacy_settings.session_id = user_id
             session.commit()
         return count
 
@@ -553,6 +617,7 @@ class PostgresChatRepository:
 
     def set_memory_enabled(self, session_id: str, enabled: bool) -> dict:
         with self._session() as session:
+            user_id = self._resolve_user_id(session, session_id)
             row = session.scalar(
                 select(MemorySettings).where(MemorySettings.session_id == session_id)
             )
@@ -560,6 +625,7 @@ class PostgresChatRepository:
             if row is None:
                 session.add(MemorySettings(
                     session_id=session_id,
+                    user_id=user_id,
                     enabled=enabled,
                     updated_at=now,
                 ))
@@ -588,6 +654,7 @@ class PostgresChatRepository:
     ) -> dict:
         now = datetime.now(timezone.utc)
         with self._session() as session:
+            user_id = self._resolve_user_id(session, session_id)
             existing = session.scalar(
                 select(MemoryEntry).where(
                     MemoryEntry.session_id == session_id,
@@ -600,7 +667,7 @@ class PostgresChatRepository:
             row = MemoryEntry(
                 id=str(uuid4()),
                 session_id=session_id,
-                user_id=session_id if session_id else None,
+                user_id=user_id,
                 category=category,
                 project=project,
                 content=content,
@@ -695,6 +762,7 @@ class PostgresChatRepository:
         source_conversation_id: str | None,
     ) -> dict | None:
         with self._session() as session:
+            user_id = self._resolve_user_id(session, session_id)
             existing = session.scalar(
                 select(MemorySuggestion).where(
                     MemorySuggestion.session_id == session_id,
@@ -706,7 +774,7 @@ class PostgresChatRepository:
             row = MemorySuggestion(
                 id=str(uuid4()),
                 session_id=session_id,
-                user_id=session_id,
+                user_id=user_id,
                 category=category,
                 project=project,
                 content=content,
@@ -774,9 +842,10 @@ class PostgresChatRepository:
         memory_id: str | None = None,
     ) -> None:
         with self._session() as session:
+            user_id = self._resolve_user_id(session, session_id)
             session.add(MemoryAudit(
                 session_id=session_id,
-                user_id=session_id,
+                user_id=user_id,
                 action=action,
                 memory_id=memory_id,
                 created_at=datetime.now(timezone.utc),

@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
+import sqlite3
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.routes import auth, chat, documents, health, memory
 from app.core.config import Settings
@@ -76,7 +78,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        repository.initialize()
+        try:
+            repository.initialize()
+        except (sqlite3.Error, SQLAlchemyError, OSError) as exc:
+            raise RuntimeError(
+                "Database initialization failed. Verify DATABASE_URL and PostgreSQL availability."
+            ) from exc
         if app_settings.initial_admin_email and app_settings.initial_admin_password:
             repository.set_initial_admin(
                 app_settings.initial_admin_email,

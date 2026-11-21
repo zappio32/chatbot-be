@@ -83,7 +83,7 @@ request timeout; valid values are greater than zero and at most 120 seconds.
 | `INITIAL_ADMIN_EMAIL` | unset | Optional initial administrator email; configure only for setup |
 | `INITIAL_ADMIN_PASSWORD` | unset | Optional initial administrator password; do not commit |
 
-| `DATABASE_URL` | `sqlite:///data/chatbot.db` | Database location/configuration; preserve the SQLite implementation unless migration tooling is added |
+| `DATABASE_URL` | `sqlite:///data/chatbot.db` | SQLite URL or Railway PostgreSQL URL (`postgres://` and `postgresql://` are accepted) |
 | `COOKIE_SAMESITE` | `lax` | Allowed values: lax or strict |
 | `COOKIE_SECURE` | `false` | Must be true in production |
 | `MAX_REQUEST_BYTES` | `12582912` | General request body limit |
@@ -129,14 +129,35 @@ expired authentication sessions and expired verification/reset tokens, and
 validates destination counts. Use `--replace-existing` only for a deliberate
 refresh of matching primary keys.
 
-PostgreSQL runtime repository support is not complete in this codebase: the
-application repository implementation remains SQLite-backed. Do not switch
-`DATABASE_URL` to PostgreSQL and assume the API will use it without completing
-the repository adapter. The migration utility is ready for staged cutover.
+The application automatically selects the PostgreSQL repository when
+`DATABASE_URL` uses a PostgreSQL URL. PostgreSQL connection or initialization
+failures stop startup and are not silently converted to SQLite storage.
 
 `CORS_ORIGINS` must contain the frontend's exact origin, including scheme and
 port. The checked-in `.env.example` includes a replaceable production-domain
 placeholder. Replace it with the deployed frontend origin; do not use `*`.
+
+### Railway
+
+Set these backend variables in Railway:
+
+```dotenv
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+ENVIRONMENT=production
+SESSION_SECRET=<at-least-32-random-characters>
+COOKIE_SECURE=true
+COOKIE_SAMESITE=lax
+CORS_ORIGINS=https://<deployed-frontend-host>
+GROQ_API_KEY=<provider-key-if-live-mode-is-used>
+GROQ_MODEL=<provider-model-if-live-mode-is-used>
+AI_PROVIDER=groq
+```
+
+Railway start command:
+
+```text
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```
 
 ## Run locally
 
